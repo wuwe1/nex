@@ -988,12 +988,32 @@ if IS_WINDOWS:
             if self.client_sock:
                 send_switch(self.client_sock, SWITCH_TO_CLIENT)
 
+        def _release_all_modifiers(self):
+            """Send key-up for all modifier keys to prevent stuck keys on Mac."""
+            sock = self.client_sock
+            if not sock:
+                return
+            # All modifier VKs with their scancodes
+            modifiers = [
+                (0xA0, 0x002A),  # Left Shift
+                (0xA1, 0x0036),  # Right Shift
+                (0xA2, 0x001D),  # Left Ctrl
+                (0xA3, 0xE01D),  # Right Ctrl
+                (0xA4, 0x0038),  # Left Alt
+                (0xA5, 0xE038),  # Right Alt
+                (0x5B, 0xE05B),  # Left Win
+                (0x5C, 0xE05C),  # Right Win
+            ]
+            for vk, sc in modifiers:
+                send_key_event(sock, vk, False, sc)
+
         def _deactivate_client(self):
             """Switch control back to Windows."""
             with self.lock:
                 if not self.active_on_client:
                     return
                 self.active_on_client = False
+            self._release_all_modifiers()
             self.ui.switch_back()
             self._uninstall_kb_hook()
             self._uninstall_mouse_hook()
