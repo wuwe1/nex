@@ -1503,19 +1503,18 @@ def main():
 
     # Startup banner
     if RICH_AVAILABLE:
-        console = Console()
         console.print()
         console.print("  [bold cyan]nex[/bold cyan] [dim]v0.1.0[/dim]", highlight=False)
         console.print("  [dim]cross-platform keyboard & mouse sharing[/dim]")
         console.print()
     else:
+        console = None
         print("\n  nex v0.1.0\n  cross-platform keyboard & mouse sharing\n")
 
     if IS_WINDOWS:
         LOG.info("Server mode [bold](Windows)[/bold]", extra={"markup": True})
-        tui_console = console if RICH_AVAILABLE else None
         server = Server(args.host, args.port, args.sensitivity, args.verbose,
-                        console=tui_console)
+                        console=console)
         server.start()
     elif IS_MAC:
         LOG.info("Client mode [bold](Mac)[/bold]", extra={"markup": True})
