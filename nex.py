@@ -57,8 +57,14 @@ if IS_MAC:
         CGEventCreateScrollWheelEvent,
         CGEventGetLocation,
         CGEventPost,
+        CGEventSetFlags,
         CGEventSetIntegerValueField,
         CGMainDisplayID,
+        kCGEventFlagMaskAlphaShift,
+        kCGEventFlagMaskShift,
+        kCGEventFlagMaskControl,
+        kCGEventFlagMaskAlternate,
+        kCGEventFlagMaskCommand,
         kCGEventLeftMouseDown,
         kCGEventLeftMouseDragged,
         kCGEventLeftMouseUp,
@@ -1288,6 +1294,21 @@ if IS_MAC:
             self.right_down = False
             self.middle_down = False
 
+            # Track modifier state for CGEvent flags
+            self._modifier_flags = 0
+            # Mac keycode -> CGEvent flag mask
+            self._MAC_MODIFIER_FLAGS = {
+                0x38: kCGEventFlagMaskShift,      # Left Shift
+                0x3C: kCGEventFlagMaskShift,      # Right Shift
+                0x3B: kCGEventFlagMaskControl,    # Left Control
+                0x3E: kCGEventFlagMaskControl,    # Right Control
+                0x37: kCGEventFlagMaskCommand,    # Left Cmd (mapped from Alt)
+                0x36: kCGEventFlagMaskCommand,    # Right Cmd
+                0x3A: kCGEventFlagMaskAlternate,  # Left Option (mapped from Win)
+                0x3D: kCGEventFlagMaskAlternate,  # Right Option
+                0x39: kCGEventFlagMaskAlphaShift, # Caps Lock
+            }
+
         def start(self):
             """Connect to server with auto-reconnect."""
             self.ui.status(f"Connecting to [bold]{self.host}:{self.port}[/bold]")
@@ -1321,6 +1342,7 @@ if IS_MAC:
             finally:
                 with self.lock:
                     self.active = False
+                self._modifier_flags = 0
                 try:
                     s.close()
                 except OSError:
@@ -1444,8 +1466,18 @@ if IS_MAC:
                     LOG.debug("Unmapped VK: 0x%02X", vkey)
                 return
 
+            # Update modifier tracking BEFORE creating the event
+            flag = self._MAC_MODIFIER_FLAGS.get(mac_keycode)
+            if flag:
+                if is_down:
+                    self._modifier_flags |= flag
+                else:
+                    self._modifier_flags &= ~flag
+
             event = CGEventCreateKeyboardEvent(None, mac_keycode, is_down)
             if event:
+                # Set modifier flags so macOS recognizes combos like Cmd+Tab
+                CGEventSetFlags(event, self._modifier_flags)
                 CGEventPost(kCGHIDEventTap, event)
 
             if self.verbose:
