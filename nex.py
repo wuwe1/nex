@@ -538,7 +538,7 @@ if IS_WINDOWS:
             # AND mask = 0xFF (transparent), XOR mask = 0x00
             and_mask = (ctypes.c_ubyte * 1)(0xFF)
             xor_mask = (ctypes.c_ubyte * 1)(0x00)
-            user32.CreateCursor.restype = ctypes.wintypes.HCURSOR
+            user32.CreateCursor.restype = ctypes.c_void_p
             self._blank_cursor = user32.CreateCursor(
                 None, 0, 0, 1, 1, and_mask, xor_mask
             )
@@ -556,11 +556,11 @@ if IS_WINDOWS:
                 # Set a blank (transparent) cursor instead of using ShowCursor counter
                 blank = self._get_blank_cursor()
                 if blank:
-                    user32.SetSystemCursor.argtypes = [ctypes.wintypes.HCURSOR, ctypes.wintypes.DWORD]
+                    user32.SetSystemCursor.argtypes = [ctypes.c_void_p, ctypes.wintypes.DWORD]
                     user32.SetSystemCursor.restype = ctypes.wintypes.BOOL
                     # Copy the blank cursor (SetSystemCursor destroys the handle)
                     user32.CopyCursor = user32.CopyIcon
-                    user32.CopyCursor.restype = ctypes.wintypes.HCURSOR
+                    user32.CopyCursor.restype = ctypes.c_void_p
                     copy = user32.CopyCursor(blank)
                     OCR_NORMAL = 32512
                     user32.SetSystemCursor(copy, OCR_NORMAL)
