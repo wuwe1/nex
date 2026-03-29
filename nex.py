@@ -474,6 +474,11 @@ if IS_WINDOWS:
     user32.GetSystemMetrics.argtypes = [ctypes.c_int]
     user32.GetSystemMetrics.restype = ctypes.c_int
 
+    user32.CallNextHookEx.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
+    ]
+    user32.CallNextHookEx.restype = ctypes.c_long
+
     SM_CXSCREEN = 0
     SM_CYSCREEN = 1
 
