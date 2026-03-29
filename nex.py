@@ -374,7 +374,8 @@ class KeyLogger:
             if self._live:
                 self._live.update(self._render())
 
-        # Build collapsed string: merge consecutive single chars into words
+        # Build collapsed string: merge consecutive single chars into words,
+        # and deduplicate repeated combos (Ctrl+W ×9)
         parts: list[str] = []
         buf = []
         for s in seq:
@@ -398,7 +399,20 @@ class KeyLogger:
         if buf:
             parts.append("".join(buf))
 
-        display = "".join(parts) if parts else ""
+        # Merge consecutive identical entries: ["Ctrl+W", "Ctrl+W", "Ctrl+W"] -> ["Ctrl+W ×3"]
+        merged: list[str] = []
+        i = 0
+        while i < len(parts):
+            count = 1
+            while i + count < len(parts) and parts[i + count] == parts[i] and parts[i] not in (" ",):
+                count += 1
+            if count > 1:
+                merged.append(f"{parts[i]} ×{count}")
+            else:
+                merged.append(parts[i])
+            i += count
+
+        display = " ".join(merged) if merged else ""
         if display:
             self.console.print(f"  [bold cyan]{target}[/bold cyan] │ {display}")
 
