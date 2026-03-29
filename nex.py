@@ -257,7 +257,7 @@ class NexUI:
     DEBOUNCE_MS = 500
     MAX_LIVE_LINES = 6
 
-    def __init__(self, console: "Console"):
+    def __init__(self, console: "Console | None" = None):
         self.console = console
         self._target_name = ""
         self._live_events: list[str] = []
@@ -270,6 +270,11 @@ class NexUI:
 
     def status(self, msg: str):
         """Print a timestamped status line."""
+        if not self.console:
+            # Strip Rich markup for plain log
+            import re
+            LOG.info(re.sub(r"\[/?[^\]]*\]", "", msg))
+            return
         ts = time.strftime("%H:%M:%S")
         self.console.print(f"  [dim]{ts}[/dim]  {msg}")
 
@@ -281,16 +286,20 @@ class NexUI:
             self._live_events.clear()
             self._sequence.clear()
             self._held_modifiers.clear()
-        self.console.print(f"\n  [bold cyan]→ {target_name}[/bold cyan]")
-        with self._lock:
-            if self._live is None:
-                self._live = Live(
-                    Text(""),
-                    console=self.console,
-                    refresh_per_second=30,
-                    transient=True,
-                )
-                self._live.start()
+        if self.console:
+            self.console.print(f"\n  [bold cyan]→ {target_name}[/bold cyan]")
+        else:
+            LOG.info("→ %s", target_name)
+        if self.console:
+            with self._lock:
+                if self._live is None:
+                    self._live = Live(
+                        Text(""),
+                        console=self.console,
+                        refresh_per_second=30,
+                        transient=True,
+                    )
+                    self._live.start()
 
     def switch_back(self):
         """Flush pending keys and stop live display."""
@@ -408,7 +417,10 @@ class NexUI:
         display = " ".join(merged) if merged else ""
         if display:
             ts = time.strftime("%H:%M:%S")
-            self.console.print(f"  [dim]{ts}[/dim]  {display}")
+            if self.console:
+                self.console.print(f"  [dim]{ts}[/dim]  {display}")
+            else:
+                LOG.info("%s  %s", ts, display)
 
     def _render(self):
         if not self._active or not self._live_events:
@@ -733,15 +745,11 @@ if IS_WINDOWS:
             self.running = True
             self.client_name = ""  # filled by handshake
 
-            # TUI
-            self.ui: NexUI | None = None
-            if console and RICH_AVAILABLE:
-                self.ui = NexUI(console)
+            self.ui = NexUI(console)
 
             # Screen dimensions
             self.screen_w = user32.GetSystemMetrics(SM_CXSCREEN)
             self.screen_h = user32.GetSystemMetrics(SM_CYSCREEN)
-            LOG.debug("Screen size: %dx%d", self.screen_w, self.screen_h)
 
             # Virtual cursor position (tracked with raw deltas)
             self.virtual_x = self.screen_w // 2
@@ -900,8 +908,7 @@ if IS_WINDOWS:
                         sock = self.client_sock
                         if sock:
                             send_key_event(sock, vkey, is_down, scancode)
-                            if self.ui:
-                                self.ui.on_key(vkey, is_down)
+                            self.ui.on_key(vkey, is_down)
                             if self.verbose:
                                 LOG.debug("Key: vk=0x%02X scan=0x%04X %s",
                                           vkey, scancode, "down" if is_down else "up")
@@ -977,10 +984,7 @@ if IS_WINDOWS:
             self._register_raw_input(suppress=True)
             self._install_kb_hook()
             self._install_mouse_hook()
-            if self.ui:
-                self.ui.switch_to(self.client_name or "Client")
-            else:
-                LOG.info("Switching control to Mac")
+            self.ui.switch_to(self.client_name or "Client")
             if self.client_sock:
                 send_switch(self.client_sock, SWITCH_TO_CLIENT)
 
@@ -990,10 +994,7 @@ if IS_WINDOWS:
                 if not self.active_on_client:
                     return
                 self.active_on_client = False
-            if self.ui:
-                self.ui.switch_back()
-            else:
-                LOG.info("Switching control back to Windows")
+            self.ui.switch_back()
             self._uninstall_kb_hook()
             self._uninstall_mouse_hook()
             self._enable_ime()
@@ -1182,10 +1183,7 @@ if IS_WINDOWS:
                 except Exception as e:
                     LOG.error("Session error: %s", e)
                 finally:
-                    if self.ui:
-                        self.ui.status("[dim]Client disconnected[/dim]")
-                    else:
-                        LOG.info("Client disconnected")
+                    self.ui.status("[dim]Disconnected[/dim]")
                     # If we were active on client, switch back
                     self._deactivate_client()
                     try:
@@ -1199,10 +1197,7 @@ if IS_WINDOWS:
             msg_type = msg[0]
             if msg_type == MSG_HELLO:
                 self.client_name = msg[1]
-                if self.ui:
-                    self.ui.status(f"[bold]{self.client_name}[/bold] connected")
-                else:
-                    LOG.info("Client: %s", self.client_name)
+                self.ui.status(f"[bold]{self.client_name}[/bold] connected")
                 # Send our hostname back
                 send_hello(self.client_sock, platform.node())
             elif msg_type == MSG_SWITCH:
@@ -1220,10 +1215,7 @@ if IS_WINDOWS:
             self._create_message_window()
             self._register_raw_input(suppress=False)
 
-            if self.ui:
-                self.ui.status(f"Listening on [bold]{self.host}:{self.port}[/bold]")
-            else:
-                LOG.info("Listening on %s:%d", self.host, self.port)
+            self.ui.status(f"Listening on [bold]{self.host}:{self.port}[/bold]")
 
             # Run Windows message pump (using PeekMessage so Ctrl+C works)
             PM_REMOVE = 0x0001
@@ -1259,9 +1251,7 @@ if IS_MAC:
             self.sock: socket.socket | None = None
 
             # TUI
-            self.ui: NexUI | None = None
-            if console and RICH_AVAILABLE:
-                self.ui = NexUI(console)
+            self.ui = NexUI(console)
 
             # Screen dimensions
             display_id = CGMainDisplayID()
@@ -1280,8 +1270,7 @@ if IS_MAC:
 
         def start(self):
             """Connect to server with auto-reconnect."""
-            if self.ui:
-                self.ui.status(f"Connecting to [bold]{self.host}:{self.port}[/bold]")
+            self.ui.status(f"Connecting to [bold]{self.host}:{self.port}[/bold]")
             while self.running:
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1299,8 +1288,7 @@ if IS_MAC:
                 send_hello(s, platform.node())
                 self._run_session(s)
                 self.sock = None
-                if self.ui:
-                    self.ui.status("[dim]Disconnected, reconnecting...[/dim]")
+                self.ui.status("[dim]Disconnected, reconnecting...[/dim]")
                 time.sleep(3)
 
         def _run_session(self, s: socket.socket):
@@ -1323,10 +1311,7 @@ if IS_MAC:
 
             if msg_type == MSG_HELLO:
                 server_name = msg[1]
-                if self.ui:
-                    self.ui.status(f"[bold]{server_name}[/bold] connected")
-                else:
-                    LOG.info("Server: %s", server_name)
+                self.ui.status(f"[bold]{server_name}[/bold] connected")
 
             elif msg_type == MSG_SWITCH:
                 direction = msg[1]
