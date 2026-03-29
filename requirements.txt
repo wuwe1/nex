@@ -1,0 +1,2 @@
+rich
+pyobjc-framework-Quartz; sys_platform == "darwin"
