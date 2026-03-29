@@ -256,7 +256,6 @@ class NexUI:
 
     DEBOUNCE_MS = 500
     MAX_LIVE_LINES = 6
-    RULE_WIDTH = 40
 
     def __init__(self, console: "Console"):
         self.console = console
@@ -282,8 +281,7 @@ class NexUI:
             self._live_events.clear()
             self._sequence.clear()
             self._held_modifiers.clear()
-        rule = "─" * self.RULE_WIDTH
-        self.console.print(f"\n  [bold cyan]→ {target_name}[/bold cyan] [dim]{rule}[/dim]")
+        self.console.print(f"\n  [bold cyan]→ {target_name}[/bold cyan]")
         with self._lock:
             if self._live is None:
                 self._live = Live(
@@ -295,7 +293,7 @@ class NexUI:
                 self._live.start()
 
     def switch_back(self):
-        """Flush pending keys, show switch-back indicator."""
+        """Flush pending keys and stop live display."""
         with self._lock:
             if not self._active:
                 return
@@ -306,8 +304,6 @@ class NexUI:
             if self._live:
                 self._live.stop()
                 self._live = None
-        rule = "─" * self.RULE_WIDTH
-        self.console.print(f"  [dim]← Windows {rule}[/dim]\n")
 
     def on_key(self, vk: int, is_down: bool):
         """Record a key event for live display."""
@@ -411,7 +407,8 @@ class NexUI:
 
         display = " ".join(merged) if merged else ""
         if display:
-            self.console.print(f"    {display}")
+            ts = time.strftime("%H:%M:%S")
+            self.console.print(f"  [dim]{ts}[/dim]  {display}")
 
     def _render(self):
         if not self._active or not self._live_events:
