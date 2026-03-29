@@ -1,0 +1,20 @@
+[project]
+name = "nex"
+version = "0.1.0"
+description = "Cross-platform keyboard & mouse sharing"
+requires-python = ">=3.10"
+dependencies = [
+    "rich",
+    "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+]
+
+[project.scripts]
+nex = "nex:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+include = ["nex.py"]
