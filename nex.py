@@ -27,7 +27,10 @@ import time
 
 try:
     from rich.console import Console
+    from rich.live import Live
     from rich.logging import RichHandler
+    from rich.table import Table
+    from rich.text import Text
     from rich.theme import Theme
     RICH_AVAILABLE = True
 except ImportError:
@@ -85,6 +88,7 @@ MSG_MOUSE_BUTTON = 2    # 1B type + 1B button_id + 1B is_pressed = 3 bytes
 MSG_KEY_EVENT = 3        # 1B type + 2B vkey(uint16) + 1B is_down + 2B scancode = 6 bytes
 MSG_SCROLL = 4           # 1B type + 2B delta(int16) = 3 bytes
 MSG_SWITCH = 5           # 1B type + 1B direction = 2 bytes
+MSG_HELLO = 6            # 1B type + 1B name_len + name_bytes (handshake)
 
 SWITCH_TO_CLIENT = 0
 SWITCH_TO_SERVER = 1
@@ -100,6 +104,7 @@ FMT_MOUSE_BUTTON = "!BBB"     # type, button_id, is_pressed
 FMT_KEY_EVENT = "!BHBH"       # type, vkey, is_down, scancode
 FMT_SCROLL = "!Bh"            # type, delta
 FMT_SWITCH = "!BB"            # type, direction
+# MSG_HELLO: !BB + name_bytes (variable length, parsed manually)
 
 DEFAULT_PORT = 24800
 
@@ -204,6 +209,209 @@ VK_TO_MAC = {
 }
 
 # ---------------------------------------------------------------------------
+# VK to human-readable name (for TUI display)
+# ---------------------------------------------------------------------------
+VK_NAMES = {
+    0x08: "Backspace", 0x09: "Tab", 0x0D: "Enter", 0x1B: "Esc",
+    0x20: "Space", 0x21: "PgUp", 0x22: "PgDn", 0x23: "End", 0x24: "Home",
+    0x25: "Left", 0x26: "Up", 0x27: "Right", 0x28: "Down",
+    0x2D: "Ins", 0x2E: "Del", 0x14: "CapsLock",
+    0x10: "Shift", 0xA0: "Shift", 0xA1: "RShift",
+    0x11: "Ctrl", 0xA2: "Ctrl", 0xA3: "RCtrl",
+    0x12: "Alt", 0xA4: "Alt", 0xA5: "RAlt",
+    0x5B: "Win", 0x5C: "RWin",
+}
+# Add F1-F12
+for _i in range(12):
+    VK_NAMES[0x70 + _i] = f"F{_i + 1}"
+# A-Z
+for _i in range(26):
+    VK_NAMES[0x41 + _i] = chr(0x41 + _i)
+# 0-9
+for _i in range(10):
+    VK_NAMES[0x30 + _i] = str(_i)
+# Punctuation
+VK_NAMES.update({
+    0xBA: ";", 0xBB: "=", 0xBC: ",", 0xBD: "-", 0xBE: ".", 0xBF: "/",
+    0xC0: "`", 0xDB: "[", 0xDC: "\\", 0xDD: "]", 0xDE: "'",
+})
+
+# Modifier VK codes (for building combos like Cmd+C)
+_MODIFIER_VKS = {0x10, 0xA0, 0xA1, 0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5, 0x5B, 0x5C}
+
+def vk_is_modifier(vk: int) -> bool:
+    return vk in _MODIFIER_VKS
+
+def vk_display_name(vk: int) -> str:
+    """Get human-readable name for a VK code."""
+    return VK_NAMES.get(vk, f"0x{vk:02X}")
+
+
+# ---------------------------------------------------------------------------
+# TUI Key Display
+# ---------------------------------------------------------------------------
+
+class KeyLogger:
+    """Live TUI display for keystrokes sent to remote machine.
+
+    While typing: shows 6 most recent key events in a live-updating panel.
+    After 500ms idle: collapses into a single human-readable line.
+    """
+
+    DEBOUNCE_MS = 500
+    MAX_LIVE_LINES = 6
+
+    def __init__(self, console: "Console"):
+        self.console = console
+        self.target_name = ""           # remote machine name
+        self._live_events: list[str] = []  # raw event lines for live display
+        self._sequence: list[str] = []     # collected readable keys for collapsed line
+        self._held_modifiers: set[str] = set()  # currently held modifier names
+        self._last_event_time = 0.0
+        self._live: Live | None = None
+        self._debounce_timer: threading.Timer | None = None
+        self._lock = threading.Lock()
+        self._active = False
+
+    def activate(self, target_name: str):
+        """Start showing keystrokes for target machine."""
+        with self._lock:
+            self._active = True
+            self.target_name = target_name
+            self._live_events.clear()
+            self._sequence.clear()
+            self._held_modifiers.clear()
+            if self._live is None:
+                self._live = Live(
+                    self._render(),
+                    console=self.console,
+                    refresh_per_second=30,
+                    transient=True,
+                )
+                self._live.start()
+
+    def deactivate(self):
+        """Stop live display and flush any pending sequence."""
+        with self._lock:
+            if not self._active:
+                return
+            self._active = False
+            self._cancel_timer()
+        self._flush_sequence()
+        with self._lock:
+            if self._live:
+                self._live.stop()
+                self._live = None
+
+    def on_key(self, vk: int, is_down: bool):
+        """Record a key event."""
+        with self._lock:
+            if not self._active:
+                return
+
+            name = vk_display_name(vk)
+            is_mod = vk_is_modifier(vk)
+            now = time.time()
+            ts = time.strftime("%H:%M:%S", time.localtime(now))
+            ms = f"{int((now % 1) * 1000):03d}"
+            arrow = "↓" if is_down else "↑"
+
+            # Live event line
+            line = f"  {ts}.{ms}  {name} {arrow}"
+            self._live_events.append(line)
+            if len(self._live_events) > self.MAX_LIVE_LINES:
+                self._live_events.pop(0)
+
+            # Build readable sequence
+            if is_mod:
+                if is_down:
+                    self._held_modifiers.add(name)
+                else:
+                    self._held_modifiers.discard(name)
+            elif is_down:
+                if self._held_modifiers:
+                    combo = "+".join(sorted(self._held_modifiers)) + "+" + name
+                    self._sequence.append(combo)
+                else:
+                    self._sequence.append(name)
+
+            self._last_event_time = now
+
+            # Update live display
+            if self._live:
+                self._live.update(self._render())
+
+            # Reset debounce timer
+            self._cancel_timer()
+            self._debounce_timer = threading.Timer(
+                self.DEBOUNCE_MS / 1000.0, self._on_debounce
+            )
+            self._debounce_timer.daemon = True
+            self._debounce_timer.start()
+
+    def _cancel_timer(self):
+        if self._debounce_timer:
+            self._debounce_timer.cancel()
+            self._debounce_timer = None
+
+    def _on_debounce(self):
+        """Called 500ms after last key event."""
+        self._flush_sequence()
+
+    def _flush_sequence(self):
+        """Collapse current sequence into a one-line summary."""
+        with self._lock:
+            if not self._sequence:
+                self._live_events.clear()
+                if self._live:
+                    self._live.update(self._render())
+                return
+            seq = list(self._sequence)
+            target = self.target_name
+            self._sequence.clear()
+            self._live_events.clear()
+            self._held_modifiers.clear()
+            if self._live:
+                self._live.update(self._render())
+
+        # Build collapsed string: merge consecutive single chars into words
+        parts: list[str] = []
+        buf = []
+        for s in seq:
+            if len(s) == 1 and s.isalnum():
+                buf.append(s)
+            else:
+                if buf:
+                    parts.append("".join(buf))
+                    buf.clear()
+                if s == "Space":
+                    if parts and not parts[-1].endswith(" "):
+                        parts.append(" ")
+                elif s == "Enter":
+                    parts.append("⏎")
+                elif s == "Backspace":
+                    parts.append("⌫")
+                elif s == "Tab":
+                    parts.append("⇥")
+                else:
+                    parts.append(s)
+        if buf:
+            parts.append("".join(buf))
+
+        display = "".join(parts) if parts else ""
+        if display:
+            self.console.print(f"  [bold cyan]{target}[/bold cyan] │ {display}")
+
+    def _render(self):
+        """Build the Rich renderable for the live panel."""
+        if not self._active or not self._live_events:
+            return Text("")
+        lines = [f"  [bold cyan]{self.target_name}[/bold cyan] ─────"]
+        lines.extend(self._live_events)
+        return Text.from_markup("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # Binary protocol helpers
 # ---------------------------------------------------------------------------
 
@@ -236,6 +444,12 @@ def send_scroll(sock: socket.socket, delta: int):
 
 def send_switch(sock: socket.socket, direction: int):
     send_raw(sock, struct.pack(FMT_SWITCH, MSG_SWITCH, direction))
+
+
+def send_hello(sock: socket.socket, name: str):
+    """Send handshake with hostname."""
+    name_bytes = name.encode("utf-8")[:255]
+    send_raw(sock, struct.pack("!BB", MSG_HELLO, len(name_bytes)) + name_bytes)
 
 
 class ProtocolReader:
@@ -277,6 +491,18 @@ class ProtocolReader:
         if not type_byte:
             raise StopIteration
         msg_type = type_byte[0]
+
+        # MSG_HELLO is variable-length
+        if msg_type == MSG_HELLO:
+            len_byte = self._recv_exact(1)
+            if not len_byte:
+                raise StopIteration
+            name_len = len_byte[0]
+            name_bytes = self._recv_exact(name_len)
+            if len(name_bytes) < name_len:
+                raise StopIteration
+            return (MSG_HELLO, name_bytes.decode("utf-8", errors="replace"))
+
         fmt_info = self.MSG_FORMATS.get(msg_type)
         if fmt_info is None:
             LOG.warning("Unknown message type: %d", msg_type)
@@ -490,7 +716,8 @@ if IS_WINDOWS:
 if IS_WINDOWS:
 
     class Server:
-        def __init__(self, host: str, port: int, sensitivity: float, verbose: bool):
+        def __init__(self, host: str, port: int, sensitivity: float, verbose: bool,
+                     console: "Console | None" = None):
             self.host = host
             self.port = port
             self.sensitivity = sensitivity
@@ -499,6 +726,12 @@ if IS_WINDOWS:
             self.active_on_client = False
             self.lock = threading.Lock()
             self.running = True
+            self.client_name = ""  # filled by handshake
+
+            # TUI key display
+            self.key_logger: KeyLogger | None = None
+            if console and RICH_AVAILABLE:
+                self.key_logger = KeyLogger(console)
 
             # Screen dimensions
             self.screen_w = user32.GetSystemMetrics(SM_CXSCREEN)
@@ -658,10 +891,12 @@ if IS_WINDOWS:
                             self._deactivate_client()
                             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-                        # Forward to Mac
+                        # Forward to Mac and TUI
                         sock = self.client_sock
                         if sock:
                             send_key_event(sock, vkey, is_down, scancode)
+                            if self.key_logger:
+                                self.key_logger.on_key(vkey, is_down)
                             if self.verbose:
                                 LOG.debug("Key: vk=0x%02X scan=0x%04X %s",
                                           vkey, scancode, "down" if is_down else "up")
@@ -738,6 +973,8 @@ if IS_WINDOWS:
             self._register_raw_input(suppress=True)
             self._install_kb_hook()
             self._install_mouse_hook()
+            if self.key_logger:
+                self.key_logger.activate(self.client_name or "Client")
             if self.client_sock:
                 send_switch(self.client_sock, SWITCH_TO_CLIENT)
 
@@ -748,6 +985,8 @@ if IS_WINDOWS:
                     return
                 self.active_on_client = False
             LOG.info("Switching control back to Windows")
+            if self.key_logger:
+                self.key_logger.deactivate()
             self._uninstall_kb_hook()
             self._uninstall_mouse_hook()
             self._enable_ime()
@@ -949,7 +1188,13 @@ if IS_WINDOWS:
         def _handle_client_msg(self, msg: tuple):
             """Handle a message from the Mac client."""
             msg_type = msg[0]
-            if msg_type == MSG_SWITCH:
+            if msg_type == MSG_HELLO:
+                self.client_name = msg[1]
+                LOG.info("Client identified as [bold]%s[/bold]", self.client_name,
+                         extra={"markup": True})
+                # Send our hostname back
+                send_hello(self.client_sock, platform.node())
+            elif msg_type == MSG_SWITCH:
                 direction = msg[1]
                 if direction == SWITCH_TO_SERVER:
                     self._deactivate_client()
@@ -1031,6 +1276,8 @@ if IS_MAC:
 
                 LOG.info("Connected to server")
                 self.sock = s
+                # Handshake: send our hostname
+                send_hello(s, platform.node())
                 self._run_session(s)
                 self.sock = None
                 LOG.info("Disconnected - retrying in 3s")
@@ -1054,7 +1301,12 @@ if IS_MAC:
         def _handle_msg(self, s: socket.socket, msg: tuple):
             msg_type = msg[0]
 
-            if msg_type == MSG_SWITCH:
+            if msg_type == MSG_HELLO:
+                server_name = msg[1]
+                LOG.info("Server identified as [bold]%s[/bold]", server_name,
+                         extra={"markup": True})
+
+            elif msg_type == MSG_SWITCH:
                 direction = msg[1]
                 if direction == SWITCH_TO_CLIENT:
                     LOG.info("Control switched to Mac")
@@ -1261,7 +1513,9 @@ def main():
 
     if IS_WINDOWS:
         LOG.info("Server mode [bold](Windows)[/bold]", extra={"markup": True})
-        server = Server(args.host, args.port, args.sensitivity, args.verbose)
+        tui_console = console if RICH_AVAILABLE else None
+        server = Server(args.host, args.port, args.sensitivity, args.verbose,
+                        console=tui_console)
         server.start()
     elif IS_MAC:
         LOG.info("Client mode [bold](Mac)[/bold]", extra={"markup": True})
