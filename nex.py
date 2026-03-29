@@ -442,6 +442,7 @@ if IS_WINDOWS:
     )
 
     WH_KEYBOARD_LL = 13
+    WH_MOUSE_LL = 14
     HC_ACTION = 0
 
     class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -508,6 +509,8 @@ if IS_WINDOWS:
             self._wndproc_ref = None  # prevent GC
             self._hookproc_ref = None  # prevent GC
             self._kb_hook = None
+            self._mouse_hookproc_ref = None  # prevent GC
+            self._mouse_hook = None
 
             # Cursor hiding
             self._cursor_hidden = False
@@ -521,6 +524,7 @@ if IS_WINDOWS:
             """Ensure cursor is unlocked and visible on exit."""
             try:
                 self._uninstall_kb_hook()
+                self._uninstall_mouse_hook()
                 user32.ClipCursor(None)
                 if self._cursor_hidden:
                     SPI_SETCURSORS = 0x0057
@@ -553,17 +557,33 @@ if IS_WINDOWS:
             user32.ClipCursor(ctypes.byref(r))
             user32.SetCursorPos(cx, cy)
             if not self._cursor_hidden:
-                # Set a blank (transparent) cursor instead of using ShowCursor counter
+                # Replace ALL system cursor types with blank cursor
                 blank = self._get_blank_cursor()
                 if blank:
                     user32.SetSystemCursor.argtypes = [ctypes.c_void_p, ctypes.wintypes.DWORD]
                     user32.SetSystemCursor.restype = ctypes.wintypes.BOOL
-                    # Copy the blank cursor (SetSystemCursor destroys the handle)
                     user32.CopyCursor = user32.CopyIcon
                     user32.CopyCursor.restype = ctypes.c_void_p
-                    copy = user32.CopyCursor(blank)
-                    OCR_NORMAL = 32512
-                    user32.SetSystemCursor(copy, OCR_NORMAL)
+                    # All standard Windows cursor IDs
+                    OCR_IDS = [
+                        32512,  # OCR_NORMAL (arrow)
+                        32513,  # OCR_IBEAM (text select)
+                        32514,  # OCR_WAIT (hourglass)
+                        32515,  # OCR_CROSS (crosshair)
+                        32516,  # OCR_UP (up arrow)
+                        32642,  # OCR_SIZENWSE
+                        32643,  # OCR_SIZENESW
+                        32644,  # OCR_SIZEWE
+                        32645,  # OCR_SIZENS
+                        32646,  # OCR_SIZEALL
+                        32648,  # OCR_NO
+                        32649,  # OCR_HAND
+                        32650,  # OCR_APPSTARTING
+                    ]
+                    for ocr_id in OCR_IDS:
+                        copy = user32.CopyCursor(blank)
+                        if copy:
+                            user32.SetSystemCursor(copy, ocr_id)
                 self._cursor_hidden = True
 
         def _unlock_cursor(self):
@@ -658,6 +678,30 @@ if IS_WINDOWS:
                 user32.UnhookWindowsHookEx(self._kb_hook)
                 self._kb_hook = None
 
+        def _install_mouse_hook(self):
+            """Install low-level mouse hook to suppress all mouse events on Windows."""
+            def mouse_hook_proc(nCode, wParam, lParam):
+                if nCode == HC_ACTION:
+                    with self.lock:
+                        is_active = self.active_on_client
+                    if is_active:
+                        # Block ALL mouse events from reaching Windows
+                        return 1
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+            self._mouse_hookproc_ref = HOOKPROC(mouse_hook_proc)
+            self._mouse_hook = user32.SetWindowsHookExW(
+                WH_MOUSE_LL, self._mouse_hookproc_ref, None, 0
+            )
+            if not self._mouse_hook:
+                LOG.warning("Failed to install mouse hook")
+
+        def _uninstall_mouse_hook(self):
+            """Remove low-level mouse hook."""
+            if self._mouse_hook:
+                user32.UnhookWindowsHookEx(self._mouse_hook)
+                self._mouse_hook = None
+
         def _disable_ime(self):
             """Disable Windows IME when control is on Mac."""
             try:
@@ -688,6 +732,7 @@ if IS_WINDOWS:
             self._disable_ime()
             self._register_raw_input(suppress=True)
             self._install_kb_hook()
+            self._install_mouse_hook()
             if self.client_sock:
                 send_switch(self.client_sock, SWITCH_TO_CLIENT)
 
@@ -699,6 +744,7 @@ if IS_WINDOWS:
                 self.active_on_client = False
             LOG.info("Switching control back to Windows")
             self._uninstall_kb_hook()
+            self._uninstall_mouse_hook()
             self._enable_ime()
             self._unlock_cursor()
             self._register_raw_input(suppress=False)
