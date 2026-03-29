@@ -509,8 +509,10 @@ if IS_WINDOWS:
             self._hookproc_ref = None  # prevent GC
             self._kb_hook = None
 
-            # Cursor visibility counter
+            # Cursor hiding
             self._cursor_hidden = False
+            self._blank_cursor = None
+            self._saved_cursor = None
 
             # Register cleanup
             atexit.register(self._cleanup)
@@ -521,28 +523,56 @@ if IS_WINDOWS:
                 self._uninstall_kb_hook()
                 user32.ClipCursor(None)
                 if self._cursor_hidden:
-                    user32.ShowCursor(True)
+                    SPI_SETCURSORS = 0x0057
+                    user32.SystemParametersInfoW(SPI_SETCURSORS, 0, None, 0)
                     self._cursor_hidden = False
                 self._unregister_raw_input()
             except Exception:
                 pass
 
+        def _get_blank_cursor(self):
+            """Create a transparent cursor (1x1 pixel, fully transparent)."""
+            if self._blank_cursor:
+                return self._blank_cursor
+            # Create a 1x1 blank cursor via CreateCursor
+            # AND mask = 0xFF (transparent), XOR mask = 0x00
+            and_mask = (ctypes.c_ubyte * 1)(0xFF)
+            xor_mask = (ctypes.c_ubyte * 1)(0x00)
+            user32.CreateCursor.restype = ctypes.wintypes.HCURSOR
+            self._blank_cursor = user32.CreateCursor(
+                None, 0, 0, 1, 1, and_mask, xor_mask
+            )
+            return self._blank_cursor
+
         def _lock_cursor(self):
-            """Hide cursor and clip to a tiny box at screen center."""
-            cx = self.screen_w // 2
+            """Hide cursor and clip to a tiny box at left edge."""
+            # Lock to left edge where the switch happens, not center
+            cx = 0
             cy = self.screen_h // 2
-            r = RECT(cx - 1, cy - 1, cx + 1, cy + 1)
+            r = RECT(cx, cy - 1, cx + 2, cy + 1)
             user32.ClipCursor(ctypes.byref(r))
-            if not self._cursor_hidden:
-                user32.ShowCursor(False)
-                self._cursor_hidden = True
             user32.SetCursorPos(cx, cy)
+            if not self._cursor_hidden:
+                # Set a blank (transparent) cursor instead of using ShowCursor counter
+                blank = self._get_blank_cursor()
+                if blank:
+                    user32.SetSystemCursor.argtypes = [ctypes.wintypes.HCURSOR, ctypes.wintypes.DWORD]
+                    user32.SetSystemCursor.restype = ctypes.wintypes.BOOL
+                    # Copy the blank cursor (SetSystemCursor destroys the handle)
+                    user32.CopyCursor = user32.CopyIcon
+                    user32.CopyCursor.restype = ctypes.wintypes.HCURSOR
+                    copy = user32.CopyCursor(blank)
+                    OCR_NORMAL = 32512
+                    user32.SetSystemCursor(copy, OCR_NORMAL)
+                self._cursor_hidden = True
 
         def _unlock_cursor(self):
-            """Show cursor and remove clip."""
+            """Restore cursor and remove clip."""
             user32.ClipCursor(None)
             if self._cursor_hidden:
-                user32.ShowCursor(True)
+                # Restore default system cursors
+                SPI_SETCURSORS = 0x0057
+                user32.SystemParametersInfoW(SPI_SETCURSORS, 0, None, 0)
                 self._cursor_hidden = False
 
         def _register_raw_input(self, suppress: bool):
