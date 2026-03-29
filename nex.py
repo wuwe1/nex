@@ -248,50 +248,54 @@ def vk_display_name(vk: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# TUI Key Display
+# TUI
 # ---------------------------------------------------------------------------
 
-class KeyLogger:
-    """Live TUI display for keystrokes sent to remote machine.
-
-    While typing: shows 6 most recent key events in a live-updating panel.
-    After 500ms idle: collapses into a single human-readable line.
-    """
+class NexUI:
+    """Unified TUI output for nex."""
 
     DEBOUNCE_MS = 500
     MAX_LIVE_LINES = 6
+    RULE_WIDTH = 40
 
     def __init__(self, console: "Console"):
         self.console = console
-        self.target_name = ""           # remote machine name
-        self._live_events: list[str] = []  # raw event lines for live display
-        self._sequence: list[str] = []     # collected readable keys for collapsed line
-        self._held_modifiers: set[str] = set()  # currently held modifier names
-        self._last_event_time = 0.0
+        self._target_name = ""
+        self._live_events: list[str] = []
+        self._sequence: list[str] = []
+        self._held_modifiers: set[str] = set()
         self._live: Live | None = None
         self._debounce_timer: threading.Timer | None = None
         self._lock = threading.Lock()
         self._active = False
 
-    def activate(self, target_name: str):
-        """Start showing keystrokes for target machine."""
+    def status(self, msg: str):
+        """Print a timestamped status line."""
+        ts = time.strftime("%H:%M:%S")
+        self.console.print(f"  [dim]{ts}[/dim]  {msg}")
+
+    def switch_to(self, target_name: str):
+        """Show switch-to-client indicator and start live key display."""
         with self._lock:
+            self._target_name = target_name
             self._active = True
-            self.target_name = target_name
             self._live_events.clear()
             self._sequence.clear()
             self._held_modifiers.clear()
+        rule = "─" * self.RULE_WIDTH
+        self.console.print(f"\n  [bold cyan]→ {target_name}[/bold cyan] [dim]{rule}[/dim]")
+        with self._lock:
             if self._live is None:
                 self._live = Live(
-                    self._render(),
+                    Text(""),
                     console=self.console,
                     refresh_per_second=30,
                     transient=True,
                 )
                 self._live.start()
 
-    def deactivate(self):
-        """Stop live display and flush any pending sequence."""
+    def switch_back(self):
+        """Flush pending keys, show switch-back indicator."""
         with self._lock:
             if not self._active:
                 return
@@ -302,9 +306,11 @@ class KeyLogger:
             if self._live:
                 self._live.stop()
                 self._live = None
+        rule = "─" * self.RULE_WIDTH
+        self.console.print(f"  [dim]← Windows {rule}[/dim]\n")
 
     def on_key(self, vk: int, is_down: bool):
-        """Record a key event."""
+        """Record a key event for live display."""
         with self._lock:
             if not self._active:
                 return
@@ -316,13 +322,11 @@ class KeyLogger:
             ms = f"{int((now % 1) * 1000):03d}"
             arrow = "↓" if is_down else "↑"
 
-            # Live event line
-            line = f"  {ts}.{ms}  {name} {arrow}"
+            line = f"    [dim]{ts}.{ms}[/dim]  {name} {arrow}"
             self._live_events.append(line)
             if len(self._live_events) > self.MAX_LIVE_LINES:
                 self._live_events.pop(0)
 
-            # Build readable sequence
             if is_mod:
                 if is_down:
                     self._held_modifiers.add(name)
@@ -335,13 +339,9 @@ class KeyLogger:
                 else:
                     self._sequence.append(name)
 
-            self._last_event_time = now
-
-            # Update live display
             if self._live:
                 self._live.update(self._render())
 
-            # Reset debounce timer
             self._cancel_timer()
             self._debounce_timer = threading.Timer(
                 self.DEBOUNCE_MS / 1000.0, self._on_debounce
@@ -355,29 +355,26 @@ class KeyLogger:
             self._debounce_timer = None
 
     def _on_debounce(self):
-        """Called 500ms after last key event."""
         self._flush_sequence()
 
     def _flush_sequence(self):
-        """Collapse current sequence into a one-line summary."""
+        """Collapse current sequence into a readable one-liner."""
         with self._lock:
             if not self._sequence:
                 self._live_events.clear()
                 if self._live:
-                    self._live.update(self._render())
+                    self._live.update(Text(""))
                 return
             seq = list(self._sequence)
-            target = self.target_name
             self._sequence.clear()
             self._live_events.clear()
             self._held_modifiers.clear()
             if self._live:
-                self._live.update(self._render())
+                self._live.update(Text(""))
 
-        # Build collapsed string: merge consecutive single chars into words,
-        # and deduplicate repeated combos (Ctrl+W ×9)
+        # Merge single chars into words, special keys into symbols
         parts: list[str] = []
-        buf = []
+        buf: list[str] = []
         for s in seq:
             if len(s) == 1 and s.isalnum():
                 buf.append(s)
@@ -399,7 +396,7 @@ class KeyLogger:
         if buf:
             parts.append("".join(buf))
 
-        # Merge consecutive identical entries: ["Ctrl+W", "Ctrl+W", "Ctrl+W"] -> ["Ctrl+W ×3"]
+        # Deduplicate consecutive identical entries
         merged: list[str] = []
         i = 0
         while i < len(parts):
@@ -414,15 +411,12 @@ class KeyLogger:
 
         display = " ".join(merged) if merged else ""
         if display:
-            self.console.print(f"  [bold cyan]{target}[/bold cyan] │ {display}")
+            self.console.print(f"    {display}")
 
     def _render(self):
-        """Build the Rich renderable for the live panel."""
         if not self._active or not self._live_events:
             return Text("")
-        lines = [f"  [bold cyan]{self.target_name}[/bold cyan] ─────"]
-        lines.extend(self._live_events)
-        return Text.from_markup("\n".join(lines))
+        return Text.from_markup("\n".join(self._live_events))
 
 
 # ---------------------------------------------------------------------------
@@ -742,15 +736,15 @@ if IS_WINDOWS:
             self.running = True
             self.client_name = ""  # filled by handshake
 
-            # TUI key display
-            self.key_logger: KeyLogger | None = None
+            # TUI
+            self.ui: NexUI | None = None
             if console and RICH_AVAILABLE:
-                self.key_logger = KeyLogger(console)
+                self.ui = NexUI(console)
 
             # Screen dimensions
             self.screen_w = user32.GetSystemMetrics(SM_CXSCREEN)
             self.screen_h = user32.GetSystemMetrics(SM_CYSCREEN)
-            LOG.info("Screen size: %dx%d", self.screen_w, self.screen_h)
+            LOG.debug("Screen size: %dx%d", self.screen_w, self.screen_h)
 
             # Virtual cursor position (tracked with raw deltas)
             self.virtual_x = self.screen_w // 2
@@ -909,8 +903,8 @@ if IS_WINDOWS:
                         sock = self.client_sock
                         if sock:
                             send_key_event(sock, vkey, is_down, scancode)
-                            if self.key_logger:
-                                self.key_logger.on_key(vkey, is_down)
+                            if self.ui:
+                                self.ui.on_key(vkey, is_down)
                             if self.verbose:
                                 LOG.debug("Key: vk=0x%02X scan=0x%04X %s",
                                           vkey, scancode, "down" if is_down else "up")
@@ -981,14 +975,15 @@ if IS_WINDOWS:
                 if self.active_on_client:
                     return
                 self.active_on_client = True
-            LOG.info("Switching control to Mac")
             self._lock_cursor()
             self._disable_ime()
             self._register_raw_input(suppress=True)
             self._install_kb_hook()
             self._install_mouse_hook()
-            if self.key_logger:
-                self.key_logger.activate(self.client_name or "Client")
+            if self.ui:
+                self.ui.switch_to(self.client_name or "Client")
+            else:
+                LOG.info("Switching control to Mac")
             if self.client_sock:
                 send_switch(self.client_sock, SWITCH_TO_CLIENT)
 
@@ -998,9 +993,10 @@ if IS_WINDOWS:
                 if not self.active_on_client:
                     return
                 self.active_on_client = False
-            LOG.info("Switching control back to Windows")
-            if self.key_logger:
-                self.key_logger.deactivate()
+            if self.ui:
+                self.ui.switch_back()
+            else:
+                LOG.info("Switching control back to Windows")
             self._uninstall_kb_hook()
             self._uninstall_mouse_hook()
             self._enable_ime()
@@ -1168,7 +1164,7 @@ if IS_WINDOWS:
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind((self.host, self.port))
             srv.listen(1)
-            LOG.info("Server listening on %s:%d", self.host, self.port)
+            LOG.debug("Server listening on %s:%d", self.host, self.port)
 
             while self.running:
                 srv.settimeout(1.0)
@@ -1179,7 +1175,6 @@ if IS_WINDOWS:
                 except OSError:
                     break
 
-                LOG.info("Client connected from %s", addr)
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.client_sock = conn
 
@@ -1190,7 +1185,10 @@ if IS_WINDOWS:
                 except Exception as e:
                     LOG.error("Session error: %s", e)
                 finally:
-                    LOG.info("Client disconnected")
+                    if self.ui:
+                        self.ui.status("[dim]Client disconnected[/dim]")
+                    else:
+                        LOG.info("Client disconnected")
                     # If we were active on client, switch back
                     self._deactivate_client()
                     try:
@@ -1204,8 +1202,10 @@ if IS_WINDOWS:
             msg_type = msg[0]
             if msg_type == MSG_HELLO:
                 self.client_name = msg[1]
-                LOG.info("Client identified as [bold]%s[/bold]", self.client_name,
-                         extra={"markup": True})
+                if self.ui:
+                    self.ui.status(f"[bold]{self.client_name}[/bold] connected")
+                else:
+                    LOG.info("Client: %s", self.client_name)
                 # Send our hostname back
                 send_hello(self.client_sock, platform.node())
             elif msg_type == MSG_SWITCH:
@@ -1223,8 +1223,10 @@ if IS_WINDOWS:
             self._create_message_window()
             self._register_raw_input(suppress=False)
 
-            LOG.info("Listening on %s:%d — move mouse to [bold]left edge[/bold] to switch to Mac",
-                     self.host, self.port, extra={"markup": True})
+            if self.ui:
+                self.ui.status(f"Listening on [bold]{self.host}:{self.port}[/bold]")
+            else:
+                LOG.info("Listening on %s:%d", self.host, self.port)
 
             # Run Windows message pump (using PeekMessage so Ctrl+C works)
             PM_REMOVE = 0x0001
@@ -1516,22 +1518,21 @@ def main():
     signal.signal(signal.SIGINT, sigint_handler)
 
     # Startup banner
+    mode = "server" if IS_WINDOWS else "client" if IS_MAC else "?"
     if RICH_AVAILABLE:
         console.print()
         console.print("  [bold cyan]nex[/bold cyan] [dim]v0.1.0[/dim]", highlight=False)
-        console.print("  [dim]cross-platform keyboard & mouse sharing[/dim]")
+        console.print(f"  [dim]{mode} · {platform.node()}[/dim]")
         console.print()
     else:
         console = None
-        print("\n  nex v0.1.0\n  cross-platform keyboard & mouse sharing\n")
+        print(f"\n  nex v0.1.0\n  {mode} · {platform.node()}\n")
 
     if IS_WINDOWS:
-        LOG.info("Server mode [bold](Windows)[/bold]", extra={"markup": True})
         server = Server(args.host, args.port, args.sensitivity, args.verbose,
                         console=console)
         server.start()
     elif IS_MAC:
-        LOG.info("Client mode [bold](Mac)[/bold]", extra={"markup": True})
         client = Client(args.host, args.port, args.sensitivity, args.verbose)
         client.start()
     else:
