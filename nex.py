@@ -1247,7 +1247,8 @@ if IS_WINDOWS:
 if IS_MAC:
 
     class Client:
-        def __init__(self, host: str, port: int, sensitivity: float, verbose: bool):
+        def __init__(self, host: str, port: int, sensitivity: float, verbose: bool,
+                     console: "Console | None" = None):
             self.host = host
             self.port = port
             self.sensitivity = sensitivity
@@ -1257,11 +1258,16 @@ if IS_MAC:
             self.running = True
             self.sock: socket.socket | None = None
 
+            # TUI
+            self.ui: NexUI | None = None
+            if console and RICH_AVAILABLE:
+                self.ui = NexUI(console)
+
             # Screen dimensions
             display_id = CGMainDisplayID()
             self.screen_w = CGDisplayPixelsWide(display_id)
             self.screen_h = CGDisplayPixelsHigh(display_id)
-            LOG.info("Screen size: %dx%d", self.screen_w, self.screen_h)
+            LOG.debug("Screen size: %dx%d", self.screen_w, self.screen_h)
 
             # Virtual absolute position (for button events that need coords)
             self.abs_x = 0.0
@@ -1274,8 +1280,9 @@ if IS_MAC:
 
         def start(self):
             """Connect to server with auto-reconnect."""
+            if self.ui:
+                self.ui.status(f"Connecting to [bold]{self.host}:{self.port}[/bold]")
             while self.running:
-                LOG.info("Connecting to %s:%d ...", self.host, self.port)
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     s.settimeout(5.0)
@@ -1283,17 +1290,17 @@ if IS_MAC:
                     s.settimeout(None)
                     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 except OSError as e:
-                    LOG.warning("Connection failed: %s - retrying in 3s", e)
+                    LOG.debug("Connection failed: %s", e)
                     time.sleep(3)
                     continue
 
-                LOG.info("Connected to server")
                 self.sock = s
                 # Handshake: send our hostname
                 send_hello(s, platform.node())
                 self._run_session(s)
                 self.sock = None
-                LOG.info("Disconnected - retrying in 3s")
+                if self.ui:
+                    self.ui.status("[dim]Disconnected, reconnecting...[/dim]")
                 time.sleep(3)
 
         def _run_session(self, s: socket.socket):
@@ -1316,13 +1323,15 @@ if IS_MAC:
 
             if msg_type == MSG_HELLO:
                 server_name = msg[1]
-                LOG.info("Server identified as [bold]%s[/bold]", server_name,
-                         extra={"markup": True})
+                if self.ui:
+                    self.ui.status(f"[bold]{server_name}[/bold] connected")
+                else:
+                    LOG.info("Server: %s", server_name)
 
             elif msg_type == MSG_SWITCH:
                 direction = msg[1]
                 if direction == SWITCH_TO_CLIENT:
-                    LOG.info("Control switched to Mac")
+                    LOG.debug("Control switched to Mac")
                     with self.lock:
                         self.active = True
                     # Keep mouse at its current position
@@ -1347,7 +1356,7 @@ if IS_MAC:
 
                 # Check right edge before clamping
                 if self.abs_x >= self.screen_w:
-                    LOG.info("Mouse hit right edge - switching back to Windows")
+                    LOG.debug("Mouse hit right edge - switching back")
                     with self.lock:
                         self.active = False
                     send_switch(s, SWITCH_TO_SERVER)
@@ -1530,7 +1539,8 @@ def main():
                         console=console)
         server.start()
     elif IS_MAC:
-        client = Client(args.host, args.port, args.sensitivity, args.verbose)
+        client = Client(args.host, args.port, args.sensitivity, args.verbose,
+                        console=console)
         client.start()
     else:
         LOG.error("Unsupported platform: %s", platform.system())
