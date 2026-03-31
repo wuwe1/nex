@@ -17,6 +17,7 @@ Usage:
 import argparse
 import atexit
 import platform
+import queue
 import signal
 import socket
 import struct
@@ -113,6 +114,16 @@ FMT_SWITCH = "!BB"            # type, direction
 # MSG_HELLO: !BB + name_bytes (variable length, parsed manually)
 
 DEFAULT_PORT = 24800
+
+# Send queue / connection health constants
+SEND_QUEUE_MAX = 500            # Max queued messages before dropping
+SEND_TIMEOUT_SEC = 2.0          # Socket send timeout
+RECV_TIMEOUT_SEC = 10.0         # Socket recv timeout for dead connection detection
+TCP_KEEPALIVE_IDLE = 10         # Seconds before first keepalive probe
+TCP_KEEPALIVE_INTERVAL = 5      # Seconds between keepalive probes
+TCP_KEEPALIVE_COUNT = 3         # Failed probes before declaring dead
+
+_STOP_SENTINEL = object()       # Signal sender thread to exit
 
 # ---------------------------------------------------------------------------
 # Windows VK to Mac keycode mapping
@@ -438,6 +449,35 @@ class NexUI:
 # Binary protocol helpers
 # ---------------------------------------------------------------------------
 
+def _clamp_i16(val: int) -> int:
+    return max(-32768, min(32767, val))
+
+
+def pack_mouse_move(dx: int, dy: int) -> bytes:
+    return struct.pack(FMT_MOUSE_MOVE, MSG_MOUSE_MOVE, _clamp_i16(dx), _clamp_i16(dy))
+
+
+def pack_mouse_button(button_id: int, is_pressed: bool) -> bytes:
+    return struct.pack(FMT_MOUSE_BUTTON, MSG_MOUSE_BUTTON, button_id, int(is_pressed))
+
+
+def pack_key_event(vkey: int, is_down: bool, scancode: int) -> bytes:
+    return struct.pack(FMT_KEY_EVENT, MSG_KEY_EVENT, vkey, int(is_down), scancode)
+
+
+def pack_scroll(delta: int) -> bytes:
+    return struct.pack(FMT_SCROLL, MSG_SCROLL, _clamp_i16(delta))
+
+
+def pack_switch(direction: int) -> bytes:
+    return struct.pack(FMT_SWITCH, MSG_SWITCH, direction)
+
+
+def pack_hello(name: str) -> bytes:
+    name_bytes = name.encode("utf-8")[:255]
+    return struct.pack("!BB", MSG_HELLO, len(name_bytes)) + name_bytes
+
+
 def send_raw(sock: socket.socket, data: bytes):
     """Send raw bytes over socket, silently ignore errors."""
     try:
@@ -447,32 +487,27 @@ def send_raw(sock: socket.socket, data: bytes):
 
 
 def send_mouse_move(sock: socket.socket, dx: int, dy: int):
-    dx = max(-32768, min(32767, dx))
-    dy = max(-32768, min(32767, dy))
-    send_raw(sock, struct.pack(FMT_MOUSE_MOVE, MSG_MOUSE_MOVE, dx, dy))
+    send_raw(sock, pack_mouse_move(dx, dy))
 
 
 def send_mouse_button(sock: socket.socket, button_id: int, is_pressed: bool):
-    send_raw(sock, struct.pack(FMT_MOUSE_BUTTON, MSG_MOUSE_BUTTON, button_id, int(is_pressed)))
+    send_raw(sock, pack_mouse_button(button_id, is_pressed))
 
 
 def send_key_event(sock: socket.socket, vkey: int, is_down: bool, scancode: int):
-    send_raw(sock, struct.pack(FMT_KEY_EVENT, MSG_KEY_EVENT, vkey, int(is_down), scancode))
+    send_raw(sock, pack_key_event(vkey, is_down, scancode))
 
 
 def send_scroll(sock: socket.socket, delta: int):
-    delta = max(-32768, min(32767, delta))
-    send_raw(sock, struct.pack(FMT_SCROLL, MSG_SCROLL, delta))
+    send_raw(sock, pack_scroll(delta))
 
 
 def send_switch(sock: socket.socket, direction: int):
-    send_raw(sock, struct.pack(FMT_SWITCH, MSG_SWITCH, direction))
+    send_raw(sock, pack_switch(direction))
 
 
 def send_hello(sock: socket.socket, name: str):
-    """Send handshake with hostname."""
-    name_bytes = name.encode("utf-8")[:255]
-    send_raw(sock, struct.pack("!BB", MSG_HELLO, len(name_bytes)) + name_bytes)
+    send_raw(sock, pack_hello(name))
 
 
 class ProtocolReader:
@@ -552,6 +587,7 @@ if IS_WINDOWS:
     WM_DESTROY = 0x0002
     WM_QUIT = 0x0012
     WM_CLOSE = 0x0010
+    WM_APP_DEACTIVATE = 0x8001  # Custom: trigger deactivation from sender thread
 
     # Raw Input constants
     RID_INPUT = 0x10000003
@@ -728,6 +764,11 @@ if IS_WINDOWS:
     ]
     user32.CallNextHookEx.restype = ctypes.c_long
 
+    user32.PostMessageW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p
+    ]
+    user32.PostMessageW.restype = ctypes.wintypes.BOOL
+
     SM_CXSCREEN = 0
     SM_CYSCREEN = 1
 
@@ -774,6 +815,11 @@ if IS_WINDOWS:
             self._blank_cursor = None
             self._saved_cursor = None
 
+            # Send queue (decouples hooks/wndproc from socket I/O)
+            self._send_queue: queue.Queue = queue.Queue(maxsize=SEND_QUEUE_MAX)
+            self._sender_thread: threading.Thread | None = None
+            self._connection_dead = False
+
             # Register cleanup
             atexit.register(self._cleanup)
 
@@ -790,6 +836,85 @@ if IS_WINDOWS:
                 self._unregister_raw_input()
             except Exception:
                 pass
+
+        def _enqueue_send(self, data: bytes):
+            """Non-blocking enqueue of pre-packed message bytes."""
+            if self._connection_dead:
+                return
+            try:
+                self._send_queue.put_nowait(data)
+            except queue.Full:
+                LOG.debug("Send queue full, dropping message")
+
+        def _sender_thread_func(self):
+            """Drain the send queue and write to socket. Coalesces mouse moves."""
+            sock = self.client_sock
+            if not sock:
+                return
+
+            while True:
+                try:
+                    data = self._send_queue.get(timeout=1.0)
+                except queue.Empty:
+                    if self._connection_dead:
+                        break
+                    continue
+
+                if data is _STOP_SENTINEL:
+                    break
+
+                # Mouse-move coalescing: merge consecutive MOUSE_MOVE into one
+                if data[0] == MSG_MOUSE_MOVE:
+                    _, dx, dy = struct.unpack(FMT_MOUSE_MOVE, data)
+                    while True:
+                        try:
+                            peek = self._send_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if peek is _STOP_SENTINEL:
+                            self._send_queue.put(peek)
+                            break
+                        if peek[0] == MSG_MOUSE_MOVE:
+                            _, pdx, pdy = struct.unpack(FMT_MOUSE_MOVE, peek)
+                            dx += pdx
+                            dy += pdy
+                        else:
+                            if not self._do_send(sock, pack_mouse_move(dx, dy)):
+                                return
+                            data = peek
+                            dx, dy = 0, 0
+                            break
+                    if dx != 0 or dy != 0:
+                        data = pack_mouse_move(dx, dy)
+
+                if not self._do_send(sock, data):
+                    return
+
+        def _do_send(self, sock: socket.socket, data: bytes) -> bool:
+            """Send data to socket. Returns False if connection is dead."""
+            try:
+                sock.sendall(data)
+                return True
+            except OSError as e:
+                LOG.warning("Send failed: %s", e)
+                self._connection_dead = True
+                self._request_deactivation()
+                return False
+
+        def _request_deactivation(self):
+            """Thread-safe: post a message to the main thread to deactivate."""
+            if self.hwnd:
+                user32.PostMessageW(self.hwnd, WM_APP_DEACTIVATE, 0, 0)
+
+        def _configure_keepalive(self, sock: socket.socket):
+            """Configure TCP keepalive to detect dead connections."""
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_COUNT)
+            except (AttributeError, OSError):
+                pass  # Older Python or unsupported platform
 
         def _get_blank_cursor(self):
             """Create a transparent cursor (1x1 pixel, fully transparent)."""
@@ -897,7 +1022,7 @@ if IS_WINDOWS:
                 if nCode == HC_ACTION:
                     with self.lock:
                         is_active = self.active_on_client
-                    if is_active:
+                    if is_active and not self._connection_dead:
                         # Extract key info from KBDLLHOOKSTRUCT
                         kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                         vkey = kb.vkCode
@@ -910,14 +1035,12 @@ if IS_WINDOWS:
                             self._deactivate_client()
                             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-                        # Forward to Mac and TUI
-                        sock = self.client_sock
-                        if sock:
-                            send_key_event(sock, vkey, is_down, scancode)
-                            self.ui.on_key(vkey, is_down)
-                            if self.verbose:
-                                LOG.debug("Key: vk=0x%02X scan=0x%04X %s",
-                                          vkey, scancode, "down" if is_down else "up")
+                        # Forward to Mac via queue (non-blocking) and TUI
+                        self._enqueue_send(pack_key_event(vkey, is_down, scancode))
+                        self.ui.on_key(vkey, is_down)
+                        if self.verbose:
+                            LOG.debug("Key: vk=0x%02X scan=0x%04X %s",
+                                      vkey, scancode, "down" if is_down else "up")
 
                         # Block the key on Windows
                         return 1
@@ -991,15 +1114,10 @@ if IS_WINDOWS:
             self._install_kb_hook()
             self._install_mouse_hook()
             self.ui.switch_to(self.client_name or "Client")
-            if self.client_sock:
-                send_switch(self.client_sock, SWITCH_TO_CLIENT)
+            self._enqueue_send(pack_switch(SWITCH_TO_CLIENT))
 
         def _release_all_modifiers(self):
             """Send key-up for all modifier keys to prevent stuck keys on Mac."""
-            sock = self.client_sock
-            if not sock:
-                return
-            # All modifier VKs with their scancodes
             modifiers = [
                 (0xA0, 0x002A),  # Left Shift
                 (0xA1, 0x0036),  # Right Shift
@@ -1011,7 +1129,7 @@ if IS_WINDOWS:
                 (0x5C, 0xE05C),  # Right Win
             ]
             for vk, sc in modifiers:
-                send_key_event(sock, vk, False, sc)
+                self._enqueue_send(pack_key_event(vk, False, sc))
 
         def _deactivate_client(self):
             """Switch control back to Windows."""
@@ -1057,14 +1175,14 @@ if IS_WINDOWS:
                 if btn_flags & RI_MOUSE_MIDDLE_BUTTON_UP:
                     button_events.append((BTN_MIDDLE, False))
 
-                if is_active and sock:
+                if is_active:
                     for btn_id, pressed in button_events:
-                        send_mouse_button(sock, btn_id, pressed)
+                        self._enqueue_send(pack_mouse_button(btn_id, pressed))
 
                 # Scroll
                 if btn_flags & RI_MOUSE_WHEEL:
-                    if is_active and sock:
-                        send_scroll(sock, mouse.usButtonData)
+                    if is_active:
+                        self._enqueue_send(pack_scroll(mouse.usButtonData))
 
             # Process movement
             if mouse.usFlags == MOUSE_MOVE_RELATIVE:
@@ -1077,8 +1195,7 @@ if IS_WINDOWS:
                     # Apply sensitivity and forward to client
                     sdx = int(dx * self.sensitivity)
                     sdy = int(dy * self.sensitivity)
-                    if sock:
-                        send_mouse_move(sock, sdx, sdy)
+                    self._enqueue_send(pack_mouse_move(sdx, sdy))
                     # Track virtual position for edge detection is not needed
                     # while active since we wait for switch_back from client.
                     # Reset physical cursor to center to keep getting deltas.
@@ -1114,14 +1231,17 @@ if IS_WINDOWS:
                 self._deactivate_client()
                 return
 
-            if is_active and self.client_sock:
-                send_key_event(self.client_sock, vkey, is_down, scancode)
+            if is_active:
+                self._enqueue_send(pack_key_event(vkey, is_down, scancode))
                 if self.verbose:
                     LOG.debug("Key: vk=0x%02X scan=0x%04X %s",
                               vkey, scancode, "down" if is_down else "up")
 
         def _wndproc(self, hwnd, msg, wparam, lparam):
             """Window procedure for raw input messages."""
+            if msg == WM_APP_DEACTIVATE:
+                self._deactivate_client()
+                return 0
             if msg == WM_INPUT:
                 # Get required buffer size
                 size = ctypes.c_uint()
@@ -1200,7 +1320,29 @@ if IS_WINDOWS:
                     break
 
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # Configure timeouts and keepalive
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
+                                struct.pack("I", int(SEND_TIMEOUT_SEC * 1000)))
+                # Recv timeout is long: server rarely receives (only HELLO/SWITCH).
+                # Dead connections are detected by send timeout + TCP keepalive.
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO,
+                                struct.pack("I", 30_000))
+                self._configure_keepalive(conn)
+
                 self.client_sock = conn
+                self._connection_dead = False
+
+                # Clear stale queue from previous connection
+                while True:
+                    try:
+                        self._send_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+                # Start sender thread
+                self._sender_thread = threading.Thread(
+                    target=self._sender_thread_func, daemon=True, name="sender")
+                self._sender_thread.start()
 
                 reader = ProtocolReader(conn)
                 try:
@@ -1209,8 +1351,17 @@ if IS_WINDOWS:
                 except Exception as e:
                     LOG.error("Session error: %s", e)
                 finally:
+                    # Stop sender thread
+                    self._connection_dead = True
+                    try:
+                        self._send_queue.put_nowait(_STOP_SENTINEL)
+                    except queue.Full:
+                        pass
+                    if self._sender_thread:
+                        self._sender_thread.join(timeout=5.0)
+                        self._sender_thread = None
+
                     self.ui.status("[dim]Disconnected[/dim]")
-                    # If we were active on client, switch back
                     self._deactivate_client()
                     try:
                         conn.close()
@@ -1224,8 +1375,7 @@ if IS_WINDOWS:
             if msg_type == MSG_HELLO:
                 self.client_name = msg[1]
                 self.ui.status(f"[bold]{self.client_name}[/bold] connected")
-                # Send our hostname back
-                send_hello(self.client_sock, platform.node())
+                self._enqueue_send(pack_hello(platform.node()))
             elif msg_type == MSG_SWITCH:
                 direction = msg[1]
                 if direction == SWITCH_TO_SERVER:
@@ -1246,16 +1396,17 @@ if IS_WINDOWS:
             # Run Windows message pump (using PeekMessage so Ctrl+C works)
             PM_REMOVE = 0x0001
             msg = MSG()
-            while self.running:
-                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
-                    if msg.message == 0x0012:  # WM_QUIT
-                        self.running = False
-                        break
-                    user32.TranslateMessage(ctypes.byref(msg))
-                    user32.DispatchMessageW(ctypes.byref(msg))
-                time.sleep(0.001)  # 1ms yield to allow Ctrl+C
-
-            self._cleanup()
+            try:
+                while self.running:
+                    while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+                        if msg.message == 0x0012:  # WM_QUIT
+                            self.running = False
+                            break
+                        user32.TranslateMessage(ctypes.byref(msg))
+                        user32.DispatchMessageW(ctypes.byref(msg))
+                    time.sleep(0.001)  # 1ms yield to allow Ctrl+C
+            finally:
+                self._cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -1319,6 +1470,13 @@ if IS_MAC:
                     s.connect((self.host, self.port))
                     s.settimeout(None)
                     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    try:
+                        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE)
+                        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL)
+                        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_COUNT)
+                    except (AttributeError, OSError):
+                        pass
                 except OSError as e:
                     LOG.debug("Connection failed: %s", e)
                     time.sleep(3)
@@ -1554,11 +1712,14 @@ def main():
             datefmt="%H:%M:%S",
         )
 
-    # Handle Ctrl+C gracefully
-    def sigint_handler(sig, frame):
-        LOG.info("Shutting down...")
+    # Handle Ctrl+C and terminal close gracefully
+    def _shutdown_handler(sig, frame):
+        LOG.info("Shutting down (signal %s)...", sig)
         sys.exit(0)
-    signal.signal(signal.SIGINT, sigint_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    if IS_WINDOWS and hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _shutdown_handler)
 
     # Startup banner
     mode = "server" if IS_WINDOWS else "client" if IS_MAC else "?"
