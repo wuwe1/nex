@@ -801,6 +801,28 @@ if IS_WINDOWS:
     ]
     user32.PostMessageW.restype = ctypes.wintypes.BOOL
 
+    # Clipboard function prototypes
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.wintypes.BOOL
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = ctypes.wintypes.BOOL
+    user32.EmptyClipboard.argtypes = []
+    user32.EmptyClipboard.restype = ctypes.wintypes.BOOL
+    user32.GetClipboardData.argtypes = [ctypes.c_uint]
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.AddClipboardFormatListener.argtypes = [ctypes.c_void_p]
+    user32.AddClipboardFormatListener.restype = ctypes.wintypes.BOOL
+    user32.RemoveClipboardFormatListener.argtypes = [ctypes.c_void_p]
+    user32.RemoveClipboardFormatListener.restype = ctypes.wintypes.BOOL
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.wintypes.BOOL
+
     SM_CXSCREEN = 0
     SM_CYSCREEN = 1
 
@@ -959,11 +981,9 @@ if IS_WINDOWS:
                 if not user32.OpenClipboard(None):
                     return None
                 try:
-                    user32.GetClipboardData.restype = ctypes.c_void_p
                     handle = user32.GetClipboardData(CF_UNICODETEXT)
                     if not handle:
                         return None
-                    kernel32.GlobalLock.restype = ctypes.c_void_p
                     ptr = kernel32.GlobalLock(handle)
                     if not ptr:
                         return None
@@ -974,7 +994,7 @@ if IS_WINDOWS:
                 finally:
                     user32.CloseClipboard()
             except Exception as e:
-                LOG.debug("Failed to read clipboard: %s", e)
+                LOG.warning("Failed to read clipboard: %s", e)
                 return None
 
         def _write_clipboard(self, text: str) -> bool:
@@ -986,11 +1006,9 @@ if IS_WINDOWS:
                 try:
                     user32.EmptyClipboard()
                     data = text.encode("utf-16-le") + b"\x00\x00"
-                    kernel32.GlobalAlloc.restype = ctypes.c_void_p
                     handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
                     if not handle:
                         return False
-                    kernel32.GlobalLock.restype = ctypes.c_void_p
                     ptr = kernel32.GlobalLock(handle)
                     ctypes.memmove(ptr, data, len(data))
                     kernel32.GlobalUnlock(handle)
@@ -999,7 +1017,7 @@ if IS_WINDOWS:
                 finally:
                     user32.CloseClipboard()
             except Exception as e:
-                LOG.debug("Failed to write clipboard: %s", e)
+                LOG.warning("Failed to write clipboard: %s", e)
                 return False
             finally:
                 self._clipboard_setting = False
@@ -1010,6 +1028,7 @@ if IS_WINDOWS:
             if text:
                 msg = pack_clipboard(text)
                 if msg:
+                    LOG.debug("Clipboard → client: %d chars", len(text))
                     self._enqueue_send(msg)
 
         def _get_blank_cursor(self):
