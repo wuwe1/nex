@@ -49,6 +49,7 @@ if IS_WINDOWS:
 
 if IS_MAC:
     import Quartz  # type: ignore
+    from AppKit import NSPasteboard, NSPasteboardTypeString  # type: ignore
     from Quartz import (  # type: ignore
         CGDisplayPixelsHigh,
         CGDisplayPixelsWide,
@@ -97,6 +98,9 @@ MSG_KEY_EVENT = 3        # 1B type + 2B vkey(uint16) + 1B is_down + 2B scancode 
 MSG_SCROLL = 4           # 1B type + 2B delta(int16) = 3 bytes
 MSG_SWITCH = 5           # 1B type + 1B direction = 2 bytes
 MSG_HELLO = 6            # 1B type + 1B name_len + name_bytes (handshake)
+MSG_CLIPBOARD = 7        # 1B type + 4B length(uint32) + UTF-8 data (variable)
+
+CLIPBOARD_MAX_BYTES = 10 * 1024 * 1024  # 10 MB limit
 
 SWITCH_TO_CLIENT = 0
 SWITCH_TO_SERVER = 1
@@ -479,6 +483,14 @@ def pack_hello(name: str) -> bytes:
     return struct.pack("!BB", MSG_HELLO, len(name_bytes)) + name_bytes
 
 
+def pack_clipboard(text: str) -> bytes | None:
+    data = text.encode("utf-8")
+    if len(data) > CLIPBOARD_MAX_BYTES:
+        LOG.warning("Clipboard too large (%d bytes), skipping", len(data))
+        return None
+    return struct.pack("!BI", MSG_CLIPBOARD, len(data)) + data
+
+
 def send_raw(sock: socket.socket, data: bytes):
     """Send raw bytes over socket, silently ignore errors."""
     try:
@@ -562,6 +574,20 @@ class ProtocolReader:
                 raise StopIteration
             return (MSG_HELLO, name_bytes.decode("utf-8", errors="replace"))
 
+        # MSG_CLIPBOARD: 4-byte length + variable data
+        if msg_type == MSG_CLIPBOARD:
+            len_bytes = self._recv_exact(4)
+            if len(len_bytes) < 4:
+                raise StopIteration
+            data_len = struct.unpack("!I", len_bytes)[0]
+            if data_len > CLIPBOARD_MAX_BYTES:
+                LOG.warning("Clipboard message too large: %d bytes", data_len)
+                raise StopIteration
+            data = self._recv_exact(data_len)
+            if len(data) < data_len:
+                raise StopIteration
+            return (MSG_CLIPBOARD, data.decode("utf-8", errors="replace"))
+
         fmt_info = self.MSG_FORMATS.get(msg_type)
         if fmt_info is None:
             LOG.warning("Unknown message type: %d", msg_type)
@@ -588,7 +614,12 @@ if IS_WINDOWS:
     WM_DESTROY = 0x0002
     WM_QUIT = 0x0012
     WM_CLOSE = 0x0010
+    WM_CLIPBOARDUPDATE = 0x031D
     WM_APP_DEACTIVATE = 0x8001  # Custom: trigger deactivation from sender thread
+
+    # Clipboard constants
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
 
     # Raw Input constants
     RID_INPUT = 0x10000003
@@ -821,6 +852,9 @@ if IS_WINDOWS:
             self._sender_thread: threading.Thread | None = None
             self._connection_dead = False
 
+            # Clipboard sync: track last synced text to avoid echo
+            self._clipboard_setting = False  # True while we're writing to clipboard
+
             # Register cleanup
             atexit.register(self._cleanup)
 
@@ -835,6 +869,8 @@ if IS_WINDOWS:
                     user32.SystemParametersInfoW(SPI_SETCURSORS, 0, None, 0)
                     self._cursor_hidden = False
                 self._unregister_raw_input()
+                if self.hwnd:
+                    user32.RemoveClipboardFormatListener(self.hwnd)
             except Exception:
                 pass
 
@@ -916,6 +952,54 @@ if IS_WINDOWS:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_COUNT)
             except (AttributeError, OSError):
                 pass  # Older Python or unsupported platform
+
+        def _read_clipboard(self) -> str | None:
+            """Read text from Windows clipboard."""
+            if not user32.OpenClipboard(None):
+                return None
+            try:
+                handle = user32.GetClipboardData(CF_UNICODETEXT)
+                if not handle:
+                    return None
+                ptr = kernel32.GlobalLock(handle)
+                if not ptr:
+                    return None
+                try:
+                    return ctypes.wstring_at(ptr)
+                finally:
+                    kernel32.GlobalUnlock(handle)
+            finally:
+                user32.CloseClipboard()
+
+        def _write_clipboard(self, text: str) -> bool:
+            """Write text to Windows clipboard."""
+            self._clipboard_setting = True
+            try:
+                if not user32.OpenClipboard(None):
+                    return False
+                try:
+                    user32.EmptyClipboard()
+                    data = text.encode("utf-16-le") + b"\x00\x00"
+                    handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                    if not handle:
+                        return False
+                    ptr = kernel32.GlobalLock(handle)
+                    ctypes.memmove(ptr, data, len(data))
+                    kernel32.GlobalUnlock(handle)
+                    user32.SetClipboardData(CF_UNICODETEXT, handle)
+                    return True
+                finally:
+                    user32.CloseClipboard()
+            finally:
+                self._clipboard_setting = False
+
+        def _sync_clipboard_to_client(self):
+            """Send current Windows clipboard to Mac client."""
+            text = self._read_clipboard()
+            if text:
+                msg = pack_clipboard(text)
+                if msg:
+                    self._enqueue_send(msg)
 
         def _get_blank_cursor(self):
             """Create a transparent cursor (1x1 pixel, fully transparent)."""
@@ -1116,6 +1200,7 @@ if IS_WINDOWS:
             self._install_mouse_hook()
             self.ui.switch_to(self.client_name or "Client")
             self._enqueue_send(pack_switch(SWITCH_TO_CLIENT))
+            self._sync_clipboard_to_client()
 
         def _release_all_modifiers(self):
             """Send key-up for all modifier keys to prevent stuck keys on Mac."""
@@ -1243,6 +1328,10 @@ if IS_WINDOWS:
             if msg == WM_APP_DEACTIVATE:
                 self._deactivate_client()
                 return 0
+            if msg == WM_CLIPBOARDUPDATE:
+                if not self._clipboard_setting:
+                    self._sync_clipboard_to_client()
+                return 0
             if msg == WM_INPUT:
                 # Get required buffer size
                 size = ctypes.c_uint()
@@ -1302,6 +1391,9 @@ if IS_WINDOWS:
             )
             if not self.hwnd:
                 LOG.error("Failed to create message window")
+                return
+            # Listen for clipboard changes
+            user32.AddClipboardFormatListener(self.hwnd)
 
         def _network_listener(self):
             """Accept connections and read messages from client (runs in thread)."""
@@ -1381,6 +1473,10 @@ if IS_WINDOWS:
                 direction = msg[1]
                 if direction == SWITCH_TO_SERVER:
                     self._deactivate_client()
+            elif msg_type == MSG_CLIPBOARD:
+                text = msg[1]
+                LOG.debug("Clipboard from client: %d chars", len(text))
+                self._write_clipboard(text)
 
         def start(self):
             """Start the server: message pump in main thread, network in background."""
@@ -1550,6 +1646,7 @@ if IS_MAC:
                     LOG.debug("Mouse hit right edge - switching back")
                     with self.lock:
                         self.active = False
+                    self._sync_clipboard_to_server(s)
                     send_switch(s, SWITCH_TO_SERVER)
                     return
 
@@ -1579,6 +1676,29 @@ if IS_MAC:
                     if not self.active:
                         return
                 self._scroll(delta)
+
+            elif msg_type == MSG_CLIPBOARD:
+                text = msg[1]
+                LOG.debug("Clipboard from server: %d chars", len(text))
+                self._write_pasteboard(text)
+
+        def _read_pasteboard(self) -> str | None:
+            pb = NSPasteboard.generalPasteboard()
+            text = pb.stringForType_(NSPasteboardTypeString)
+            return str(text) if text else None
+
+        def _write_pasteboard(self, text: str):
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            pb.setString_forType_(text, NSPasteboardTypeString)
+
+        def _sync_clipboard_to_server(self, s: socket.socket):
+            """Send current Mac clipboard to Windows server."""
+            text = self._read_pasteboard()
+            if text:
+                msg = pack_clipboard(text)
+                if msg:
+                    send_raw(s, msg)
 
         def _move_mouse(self, dx: int, dy: int):
             """Inject a mouse move event using Quartz CGEvent with raw deltas."""
