@@ -129,6 +129,8 @@ TCP_KEEPALIVE_COUNT = 3         # Failed probes before declaring dead
 
 _STOP_SENTINEL = object()       # Signal sender thread to exit
 
+EDGE_STICK_THRESHOLD = 50       # Pixels of accumulated delta to break through edge
+
 # ---------------------------------------------------------------------------
 # Windows VK to Mac keycode mapping
 # ---------------------------------------------------------------------------
@@ -868,6 +870,9 @@ if IS_WINDOWS:
             self._sender_thread: threading.Thread | None = None
             self._connection_dead = False
 
+            # Sticky edge: accumulate delta before switching
+            self._edge_accumulator = 0
+
             # Clipboard sync: debounce to prevent echo loops
             self._clipboard_write_time = 0.0  # monotonic timestamp of last write
 
@@ -1312,7 +1317,14 @@ if IS_WINDOWS:
 
                     if self.virtual_x <= 0 and sock:
                         self.virtual_x = 0
-                        self._activate_client()
+                        # Sticky edge: accumulate leftward delta before switching
+                        self._edge_accumulator += abs(dx)
+                        if self._edge_accumulator >= EDGE_STICK_THRESHOLD:
+                            self._edge_accumulator = 0
+                            self._activate_client()
+                    elif self._edge_accumulator > 0:
+                        # Moved away from edge, reset
+                        self._edge_accumulator = 0
 
         def _handle_raw_keyboard(self, raw):
             """Process raw keyboard input data."""
@@ -1563,6 +1575,9 @@ if IS_MAC:
             self._last_click_time: dict[int, float] = {}  # button_id -> timestamp
             self._last_click_pos: dict[int, tuple[float, float]] = {}  # button_id -> (x, y)
 
+            # Sticky edge: accumulate delta before switching back
+            self._edge_accumulator = 0
+
             # Track modifier state for CGEvent flags
             self._modifier_flags = 0
             # Mac keycode -> CGEvent flag mask
@@ -1651,14 +1666,21 @@ if IS_MAC:
                 self.abs_x += sdx
                 self.abs_y += sdy
 
-                # Check right edge before clamping
+                # Check right edge with sticky resistance
                 if self.abs_x >= self.screen_w:
-                    LOG.debug("Mouse hit right edge - switching back")
-                    with self.lock:
-                        self.active = False
-                    self._sync_clipboard_to_server(s)
-                    send_switch(s, SWITCH_TO_SERVER)
+                    self.abs_x = float(self.screen_w)
+                    self._edge_accumulator += abs(sdx)
+                    if self._edge_accumulator >= EDGE_STICK_THRESHOLD:
+                        LOG.debug("Mouse pushed through right edge - switching back")
+                        self._edge_accumulator = 0
+                        with self.lock:
+                            self.active = False
+                        self._sync_clipboard_to_server(s)
+                        send_switch(s, SWITCH_TO_SERVER)
                     return
+                elif self._edge_accumulator > 0:
+                    # Moved away from edge, reset
+                    self._edge_accumulator = 0
 
                 # Clamp
                 self.abs_x = max(0.0, min(float(self.screen_w - 1), self.abs_x))
