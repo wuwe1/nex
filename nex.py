@@ -129,7 +129,7 @@ TCP_KEEPALIVE_COUNT = 3         # Failed probes before declaring dead
 
 _STOP_SENTINEL = object()       # Signal sender thread to exit
 
-EDGE_STICK_THRESHOLD = 50       # Pixels of accumulated delta to break through edge
+EDGE_STICK_THRESHOLD = 100      # Pixels of accumulated delta to break through edge
 
 # ---------------------------------------------------------------------------
 # Windows VK to Mac keycode mapping
