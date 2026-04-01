@@ -123,7 +123,6 @@ DEFAULT_PORT = 24800
 # Send queue / connection health constants
 SEND_QUEUE_MAX = 500            # Max queued messages before dropping
 SEND_TIMEOUT_SEC = 2.0          # Socket send timeout
-RECV_TIMEOUT_SEC = 10.0         # Socket recv timeout for dead connection detection
 TCP_KEEPALIVE_IDLE = 10         # Seconds before first keepalive probe
 TCP_KEEPALIVE_INTERVAL = 5      # Seconds between keepalive probes
 TCP_KEEPALIVE_COUNT = 3         # Failed probes before declaring dead
@@ -491,28 +490,23 @@ def pack_clipboard(text: str) -> bytes | None:
     return struct.pack("!BI", MSG_CLIPBOARD, len(data)) + data
 
 
+def configure_keepalive(sock: socket.socket):
+    """Configure TCP keepalive to detect dead connections."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_COUNT)
+    except (AttributeError, OSError):
+        pass
+
+
 def send_raw(sock: socket.socket, data: bytes):
     """Send raw bytes over socket, silently ignore errors."""
     try:
         sock.sendall(data)
     except OSError:
         pass
-
-
-def send_mouse_move(sock: socket.socket, dx: int, dy: int):
-    send_raw(sock, pack_mouse_move(dx, dy))
-
-
-def send_mouse_button(sock: socket.socket, button_id: int, is_pressed: bool):
-    send_raw(sock, pack_mouse_button(button_id, is_pressed))
-
-
-def send_key_event(sock: socket.socket, vkey: int, is_down: bool, scancode: int):
-    send_raw(sock, pack_key_event(vkey, is_down, scancode))
-
-
-def send_scroll(sock: socket.socket, delta: int):
-    send_raw(sock, pack_scroll(delta))
 
 
 def send_switch(sock: socket.socket, direction: int):
@@ -874,8 +868,8 @@ if IS_WINDOWS:
             self._sender_thread: threading.Thread | None = None
             self._connection_dead = False
 
-            # Clipboard sync: track last synced text to avoid echo
-            self._clipboard_setting = False  # True while we're writing to clipboard
+            # Clipboard sync: debounce to prevent echo loops
+            self._clipboard_write_time = 0.0  # monotonic timestamp of last write
 
             # Register cleanup
             atexit.register(self._cleanup)
@@ -965,15 +959,9 @@ if IS_WINDOWS:
             if self.hwnd:
                 user32.PostMessageW(self.hwnd, WM_APP_DEACTIVATE, 0, 0)
 
-        def _configure_keepalive(self, sock: socket.socket):
-            """Configure TCP keepalive to detect dead connections."""
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            try:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_COUNT)
-            except (AttributeError, OSError):
-                pass  # Older Python or unsupported platform
+        @staticmethod
+        def _configure_keepalive(sock: socket.socket):
+            configure_keepalive(sock)
 
         def _read_clipboard(self) -> str | None:
             """Read text from Windows clipboard."""
@@ -999,7 +987,6 @@ if IS_WINDOWS:
 
         def _write_clipboard(self, text: str) -> bool:
             """Write text to Windows clipboard."""
-            self._clipboard_setting = True
             try:
                 if not user32.OpenClipboard(None):
                     return False
@@ -1013,14 +1000,14 @@ if IS_WINDOWS:
                     ctypes.memmove(ptr, data, len(data))
                     kernel32.GlobalUnlock(handle)
                     user32.SetClipboardData(CF_UNICODETEXT, handle)
+                    # Mark timestamp so WM_CLIPBOARDUPDATE ignores this change
+                    self._clipboard_write_time = time.monotonic()
                     return True
                 finally:
                     user32.CloseClipboard()
             except Exception as e:
                 LOG.warning("Failed to write clipboard: %s", e)
                 return False
-            finally:
-                self._clipboard_setting = False
 
         def _sync_clipboard_to_client(self):
             """Send current Windows clipboard to Mac client."""
@@ -1359,7 +1346,8 @@ if IS_WINDOWS:
                 self._deactivate_client()
                 return 0
             if msg == WM_CLIPBOARDUPDATE:
-                if not self._clipboard_setting:
+                # Ignore if we just wrote to clipboard (debounce echo)
+                if time.monotonic() - self._clipboard_write_time > 0.5 and self.client_sock:
                     self._sync_clipboard_to_client()
                 return 0
             if msg == WM_INPUT:
@@ -1602,13 +1590,7 @@ if IS_MAC:
                     s.connect((self.host, self.port))
                     s.settimeout(None)
                     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                    try:
-                        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE)
-                        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL)
-                        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_COUNT)
-                    except (AttributeError, OSError):
-                        pass
+                    configure_keepalive(s)
                 except OSError as e:
                     LOG.debug("Connection failed: %s", e)
                     time.sleep(3)
