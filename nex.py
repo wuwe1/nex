@@ -955,21 +955,27 @@ if IS_WINDOWS:
 
         def _read_clipboard(self) -> str | None:
             """Read text from Windows clipboard."""
-            if not user32.OpenClipboard(None):
-                return None
             try:
-                handle = user32.GetClipboardData(CF_UNICODETEXT)
-                if not handle:
-                    return None
-                ptr = kernel32.GlobalLock(handle)
-                if not ptr:
+                if not user32.OpenClipboard(None):
                     return None
                 try:
-                    return ctypes.wstring_at(ptr)
+                    user32.GetClipboardData.restype = ctypes.c_void_p
+                    handle = user32.GetClipboardData(CF_UNICODETEXT)
+                    if not handle:
+                        return None
+                    kernel32.GlobalLock.restype = ctypes.c_void_p
+                    ptr = kernel32.GlobalLock(handle)
+                    if not ptr:
+                        return None
+                    try:
+                        return ctypes.wstring_at(ptr)
+                    finally:
+                        kernel32.GlobalUnlock(handle)
                 finally:
-                    kernel32.GlobalUnlock(handle)
-            finally:
-                user32.CloseClipboard()
+                    user32.CloseClipboard()
+            except Exception as e:
+                LOG.debug("Failed to read clipboard: %s", e)
+                return None
 
         def _write_clipboard(self, text: str) -> bool:
             """Write text to Windows clipboard."""
@@ -980,9 +986,11 @@ if IS_WINDOWS:
                 try:
                     user32.EmptyClipboard()
                     data = text.encode("utf-16-le") + b"\x00\x00"
+                    kernel32.GlobalAlloc.restype = ctypes.c_void_p
                     handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
                     if not handle:
                         return False
+                    kernel32.GlobalLock.restype = ctypes.c_void_p
                     ptr = kernel32.GlobalLock(handle)
                     ctypes.memmove(ptr, data, len(data))
                     kernel32.GlobalUnlock(handle)
@@ -990,6 +998,9 @@ if IS_WINDOWS:
                     return True
                 finally:
                     user32.CloseClipboard()
+            except Exception as e:
+                LOG.debug("Failed to write clipboard: %s", e)
+                return False
             finally:
                 self._clipboard_setting = False
 
