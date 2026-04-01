@@ -80,6 +80,7 @@ if IS_MAC:
         kCGMouseButtonCenter,
         kCGMouseButtonLeft,
         kCGMouseButtonRight,
+        kCGMouseEventClickState,
         kCGMouseEventDeltaX,
         kCGMouseEventDeltaY,
         kCGScrollEventUnitLine,
@@ -1445,6 +1446,11 @@ if IS_MAC:
             self.right_down = False
             self.middle_down = False
 
+            # Click count tracking for double/triple click
+            self._click_count: dict[int, int] = {}   # button_id -> current click count
+            self._last_click_time: dict[int, float] = {}  # button_id -> timestamp
+            self._last_click_pos: dict[int, tuple[float, float]] = {}  # button_id -> (x, y)
+
             # Track modifier state for CGEvent flags
             self._modifier_flags = 0
             # Mac keycode -> CGEvent flag mask
@@ -1594,7 +1600,7 @@ if IS_MAC:
                 CGEventPost(kCGHIDEventTap, event)
 
         def _mouse_button(self, button_id: int, pressed: bool):
-            """Inject a mouse button event."""
+            """Inject a mouse button event with correct click count."""
             point = Quartz.CGPointMake(self.abs_x, self.abs_y)
 
             if button_id == BTN_LEFT:
@@ -1612,8 +1618,25 @@ if IS_MAC:
             else:
                 return
 
+            # Track click count for double/triple click
+            click_count = 1
+            if pressed:
+                now = time.time()
+                last_t = self._last_click_time.get(button_id, 0.0)
+                last_pos = self._last_click_pos.get(button_id, (0.0, 0.0))
+                dist = ((self.abs_x - last_pos[0]) ** 2 + (self.abs_y - last_pos[1]) ** 2) ** 0.5
+                # macOS double-click threshold: ~500ms and ~5px movement
+                if now - last_t < 0.5 and dist < 5.0:
+                    click_count = self._click_count.get(button_id, 1) + 1
+                self._click_count[button_id] = click_count
+                self._last_click_time[button_id] = now
+                self._last_click_pos[button_id] = (self.abs_x, self.abs_y)
+            else:
+                click_count = self._click_count.get(button_id, 1)
+
             event = CGEventCreateMouseEvent(None, event_type, point, cg_button)
             if event:
+                CGEventSetIntegerValueField(event, kCGMouseEventClickState, click_count)
                 CGEventPost(kCGHIDEventTap, event)
 
         def _key_event(self, vkey: int, is_down: bool):
