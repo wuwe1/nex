@@ -1646,6 +1646,8 @@ if IS_MAC:
                     LOG.debug("Control switched to Mac")
                     with self.lock:
                         self.active = True
+                    # Clear modifier state to prevent stuck keys from prior session
+                    self._modifier_flags = 0
                     # Keep mouse at its current position
                     cur_pos = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
                     self.abs_x = cur_pos.x
