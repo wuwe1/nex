@@ -1431,13 +1431,11 @@ if IS_WINDOWS:
                     break
 
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                # Configure timeouts and keepalive
+                # Configure send timeout and keepalive.
+                # No recv timeout: Mac rarely sends (only SWITCH/CLIPBOARD).
+                # Dead connections are detected by send timeout + TCP keepalive.
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
                                 struct.pack("I", int(SEND_TIMEOUT_SEC * 1000)))
-                # Recv timeout is long: server rarely receives (only HELLO/SWITCH).
-                # Dead connections are detected by send timeout + TCP keepalive.
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO,
-                                struct.pack("I", 30_000))
                 self._configure_keepalive(conn)
 
                 self.client_sock = conn
